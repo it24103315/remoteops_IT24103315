@@ -1,0 +1,36 @@
+================================================================================
+RemoteOps Design Diary - Student Registration Number: IT24103315
+================================================================================
+
+Date: 2026-10-03
+Stage: Project Initialization & Core Commands Implementation
+
+Key Decisions Made:
+1. Concurrency Model:
+   - Selected multi-threading using POSIX Threads (pthreads) to handle simultaneous 
+     Controller connections cleanly. pthreads provide lightweight context switching 
+     and allow sharing state efficiently, which will be essential when managing the 
+     UDP monitoring thread later.
+
+2. Protocol Framing:
+   - Implemented line-based ASCII framing ending with '\n'. Used per-byte stream 
+     accumulation to handle partial recv() buffers reliably without dropping data.
+
+3. Authentication Gate:
+   - Required token 'OPS-3315' prior to permitting any other commands. All responses 
+     strictly append the reversed session tag 'SID:5133'.
+
+4. System Information & Process Listing:
+   - Read /proc/loadavg, /proc/meminfo, and /proc/uptime directly from the Linux 
+     virtual filesystem to ensure accurate and lightweight metric reporting.
+   - Used popen() with 'ps -eo comm,pid --no-headers' to return a comma-separated 
+     snapshot of active processes.
+
+5. Restricted Command Execution (EXEC):
+   - Implemented a strict whitelist: DATE, UPTIME, DISKFREE, HOSTNAME, WHOAMI.
+   - Any other input is deliberately rejected with ERR 002 COMMAND_NOT_ALLOWED 
+     for security.
+
+Obstacles & Solutions:
+- Ensuring thread safety when writing to remoteops_IT24103315.log:
+  Resolved by introducing a global pthread_mutex_t (log_mutex) around all file writes.
