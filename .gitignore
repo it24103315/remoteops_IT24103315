@@ -1,3 +1,6 @@
 agent_315
 controller_315
 *.o
+sample_report.txt
+downloaded_*
+test_sample.txt
