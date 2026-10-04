@@ -5,7 +5,21 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
+
+int recv_line(int sock, char *buf, int max_len) {
+    int idx = 0;
+    while (idx < max_len - 1) {
+        char c;
+        int n = recv(sock, &c, 1, 0);
+        if (n <= 0) return -1;
+        if (c == '\r') continue;
+        if (c == '\n') break;
+        buf[idx++] = c;
+    }
+    buf[idx] = '\0';
+    return idx;
+}
 
 int main(int argc, char *argv[]) {
     char *server_ip = "127.0.0.1";
@@ -36,8 +50,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Connected! Type commands (e.g., AUTH OPS-3315, QUIT)\n");
-    printf("----------------------------------------------------\n");
+    printf("Connected! Type commands (e.g., AUTH OPS-3315, PUT <filename>, GET <filename>)\n");
+    printf("-----------------------------------------------------------------------------\n");
 
     char input[BUFFER_SIZE];
     char recv_buf[BUFFER_SIZE];
@@ -46,30 +60,89 @@ int main(int argc, char *argv[]) {
         printf("RemoteOps> ");
         fflush(stdout);
 
-        if (!fgets(input, sizeof(input), stdin)) {
-            break;
+        if (!fgets(input, sizeof(input), stdin)) break;
+
+        char cmd[BUFFER_SIZE];
+        strcpy(cmd, input);
+        size_t len = strlen(cmd);
+        if (len > 0 && cmd[len - 1] == '\n') cmd[len - 1] = '\0';
+
+        // === LOCAL PUT HANDLING ===
+        if (strncmp(cmd, "PUT ", 4) == 0) {
+            char fname[256];
+            if (sscanf(cmd + 4, "%255s", fname) == 1) {
+                FILE *fp = fopen(fname, "rb");
+                if (!fp) {
+                    printf("[!] Local file not found: %s\n", fname);
+                    continue;
+                }
+                fseek(fp, 0, SEEK_END);
+                long fsize = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+
+                char put_cmd[512];
+                snprintf(put_cmd, sizeof(put_cmd), "PUT %s %ld\n", fname, fsize);
+                send(sock_fd, put_cmd, strlen(put_cmd), 0);
+
+                char file_buf[BUFFER_SIZE];
+                size_t r;
+                while ((r = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
+                    send(sock_fd, file_buf, r, 0);
+                }
+                fclose(fp);
+
+                if (recv_line(sock_fd, recv_buf, sizeof(recv_buf)) > 0) {
+                    printf("%s\n", recv_buf);
+                }
+                continue;
+            }
+        }
+        // === LOCAL GET HANDLING ===
+        else if (strncmp(cmd, "GET ", 4) == 0) {
+            char fname[256];
+            if (sscanf(cmd + 4, "%255s", fname) == 1) {
+                send(sock_fd, input, strlen(input), 0);
+
+                if (recv_line(sock_fd, recv_buf, sizeof(recv_buf)) > 0) {
+                    printf("%s\n", recv_buf);
+
+                    if (strncmp(recv_buf, "OK FILE_SEND ", 13) == 0) {
+                        char resp_fname[256];
+                        long fsize = 0;
+                        sscanf(recv_buf + 13, "%255s %ld", resp_fname, &fsize);
+
+                        char save_as[512];
+                        snprintf(save_as, sizeof(save_as), "downloaded_%s", fname);
+                        FILE *fp = fopen(save_as, "wb");
+                        if (fp) {
+                            long remaining = fsize;
+                            char file_buf[BUFFER_SIZE];
+                            while (remaining > 0) {
+                                int to_read = remaining > BUFFER_SIZE ? BUFFER_SIZE : (int)remaining;
+                                int n = recv(sock_fd, file_buf, to_read, 0);
+                                if (n <= 0) break;
+                                fwrite(file_buf, 1, n, fp);
+                                remaining -= n;
+                            }
+                            fclose(fp);
+                            printf("[+] Successfully saved downloaded file as '%s' (%ld bytes)\n", save_as, fsize);
+                        }
+                    }
+                }
+                continue;
+            }
         }
 
-        // Send command to Agent (includes \n)
-        if (send(sock_fd, input, strlen(input), 0) < 0) {
-            perror("Send failed");
-            break;
-        }
+        // Generic commands
+        if (send(sock_fd, input, strlen(input), 0) < 0) break;
 
-        // Receive response line from Agent
-        memset(recv_buf, 0, sizeof(recv_buf));
-        int bytes = recv(sock_fd, recv_buf, sizeof(recv_buf) - 1, 0);
-        if (bytes <= 0) {
+        if (recv_line(sock_fd, recv_buf, sizeof(recv_buf)) <= 0) {
             printf("[!] Server closed connection.\n");
             break;
         }
+        printf("%s\n", recv_buf);
 
-        printf("%s", recv_buf);
-
-        // If user typed QUIT and server replied OK BYE
-        if (strncmp(input, "QUIT", 4) == 0) {
-            break;
-        }
+        if (strncmp(input, "QUIT", 4) == 0) break;
     }
 
     close(sock_fd);

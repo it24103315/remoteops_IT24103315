@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -12,11 +13,12 @@
 #define SID_TAG "SID:5133"
 #define AUTH_TOKEN "OPS-3315"
 #define LOG_FILE "remoteops_IT24103315.log"
+#define STORAGE_DIR "./agentfiles/IT24103315"
 #define BUFFER_SIZE 4096
+#define MAX_FILE_SIZE (10 * 1024 * 1024)
 
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Thread-safe logger
 void write_log(const char *client_ip, int client_port, const char *action, const char *details) {
     pthread_mutex_lock(&log_mutex);
     FILE *f = fopen(LOG_FILE, "a");
@@ -30,7 +32,6 @@ void write_log(const char *client_ip, int client_port, const char *action, const
     pthread_mutex_unlock(&log_mutex);
 }
 
-// 1. SYSINFO Helper: Read Linux /proc stats
 void get_sysinfo(char *output, size_t max_len) {
     double load = 0.0;
     FILE *f_load = fopen("/proc/loadavg", "r");
@@ -64,7 +65,6 @@ void get_sysinfo(char *output, size_t max_len) {
     snprintf(output, max_len, "OK SYSINFO %.2f %ld %ld %s\n", load, used_mem_mb, uptime_sec, SID_TAG);
 }
 
-// 2. LISTPROC Helper: Snapshot processes
 void get_listproc(char *output, size_t max_len) {
     FILE *fp = popen("ps -eo comm,pid --no-headers | head -n 25", "r");
     if (!fp) {
@@ -82,19 +82,15 @@ void get_listproc(char *output, size_t max_len) {
         if (sscanf(line, "%63s %d", comm, &pid) == 2) {
             char entry[128];
             snprintf(entry, sizeof(entry), "%s[%d]", comm, pid);
-            if (!first) {
-                strncat(list_buf, ",", sizeof(list_buf) - strlen(list_buf) - 1);
-            }
+            if (!first) strncat(list_buf, ",", sizeof(list_buf) - strlen(list_buf) - 1);
             strncat(list_buf, entry, sizeof(list_buf) - strlen(list_buf) - 1);
             first = 0;
         }
     }
     pclose(fp);
-
     snprintf(output, max_len, "OK PROCS %s %s\n", list_buf, SID_TAG);
 }
 
-// 3. EXEC Whitelist Handler
 void execute_whitelisted(const char *cmd_name, char *output, size_t max_len) {
     const char *shell_cmd = NULL;
 
@@ -121,8 +117,22 @@ void execute_whitelisted(const char *cmd_name, char *output, size_t max_len) {
         if (len > 0 && result[len - 1] == '\n') result[len - 1] = '\0';
     }
     pclose(fp);
-
     snprintf(output, max_len, "OK EXEC_RESULT %s %s\n", result, SID_TAG);
+}
+
+// Robust helper to read a line ending with \n
+int read_line(int fd, char *buf, int max_len) {
+    int idx = 0;
+    while (idx < max_len - 1) {
+        char c;
+        int r = recv(fd, &c, 1, 0);
+        if (r <= 0) return -1;
+        if (c == '\r') continue;
+        if (c == '\n') break;
+        buf[idx++] = c;
+    }
+    buf[idx] = '\0';
+    return idx;
 }
 
 typedef struct {
@@ -144,72 +154,132 @@ void *handle_client(void *arg) {
     printf("[+] Client connected from %s:%d\n", client_ip, client_port);
 
     int is_authenticated = 0;
-    char recv_buf[BUFFER_SIZE];
     char line_buf[BUFFER_SIZE];
-    int line_len = 0;
+
+    mkdir(STORAGE_DIR, 0755);
 
     while (1) {
-        memset(recv_buf, 0, sizeof(recv_buf));
-        int bytes = recv(client_fd, recv_buf, sizeof(recv_buf) - 1, 0);
-        if (bytes <= 0) break;
+        int len = read_line(client_fd, line_buf, sizeof(line_buf));
+        if (len < 0) break; // Client disconnected
 
-        for (int i = 0; i < bytes; i++) {
-            char c = recv_buf[i];
-            if (c == '\r') continue;
-            if (c == '\n') {
-                line_buf[line_len] = '\0';
-                while (line_len > 0 && line_buf[line_len - 1] == ' ') {
-                    line_buf[--line_len] = '\0';
-                }
+        // Trim trailing space
+        while (len > 0 && line_buf[len - 1] == ' ') line_buf[--len] = '\0';
+        if (len == 0) continue;
 
-                if (line_len > 0) {
-                    write_log(client_ip, client_port, "COMMAND", line_buf);
-                    printf("[%s:%d] Command: %s\n", client_ip, client_port, line_buf);
+        write_log(client_ip, client_port, "COMMAND", line_buf);
+        printf("[%s:%d] Command: %s\n", client_ip, client_port, line_buf);
 
-                    char response[BUFFER_SIZE];
-                    memset(response, 0, sizeof(response));
+        char response[BUFFER_SIZE];
+        memset(response, 0, sizeof(response));
 
-                    if (strncmp(line_buf, "AUTH ", 5) == 0) {
-                        char *token = line_buf + 5;
-                        if (strcmp(token, AUTH_TOKEN) == 0) {
-                            is_authenticated = 1;
-                            snprintf(response, sizeof(response), "OK AUTHENTICATED %s\n", SID_TAG);
-                            write_log(client_ip, client_port, "AUTH", "Success");
-                        } else {
-                            snprintf(response, sizeof(response), "ERR 001 AUTH_FAILED %s\n", SID_TAG);
-                            write_log(client_ip, client_port, "AUTH", "Failed token");
-                        }
-                    } else if (strcmp(line_buf, "QUIT") == 0) {
-                        snprintf(response, sizeof(response), "OK BYE %s\n", SID_TAG);
-                        send(client_fd, response, strlen(response), 0);
-                        write_log(client_ip, client_port, "DISCONNECT", "Graceful QUIT");
-                        goto cleanup;
-                    } else if (!is_authenticated) {
-                        snprintf(response, sizeof(response), "ERR 001 AUTH_REQUIRED %s\n", SID_TAG);
-                        write_log(client_ip, client_port, "ERROR", "Command rejected: Not authenticated");
-                    } else if (strcmp(line_buf, "SYSINFO") == 0) {
-                        get_sysinfo(response, sizeof(response));
-                    } else if (strcmp(line_buf, "LISTPROC") == 0) {
-                        get_listproc(response, sizeof(response));
-                    } else if (strncmp(line_buf, "EXEC ", 5) == 0) {
-                        char *exec_cmd = line_buf + 5;
-                        execute_whitelisted(exec_cmd, response, sizeof(response));
-                    } else {
-                        snprintf(response, sizeof(response), "ERR 002 COMMAND_NOT_ALLOWED %s\n", SID_TAG);
-                    }
-
-                    send(client_fd, response, strlen(response), 0);
-                }
-                line_len = 0;
+        if (strncmp(line_buf, "AUTH ", 5) == 0) {
+            char *token = line_buf + 5;
+            if (strcmp(token, AUTH_TOKEN) == 0) {
+                is_authenticated = 1;
+                snprintf(response, sizeof(response), "OK AUTHENTICATED %s\n", SID_TAG);
+                write_log(client_ip, client_port, "AUTH", "Success");
             } else {
-                if (line_len < BUFFER_SIZE - 1) {
-                    line_buf[line_len++] = c;
+                snprintf(response, sizeof(response), "ERR 001 AUTH_FAILED %s\n", SID_TAG);
+                write_log(client_ip, client_port, "AUTH", "Failed token");
+            }
+            send(client_fd, response, strlen(response), 0);
+        } else if (strcmp(line_buf, "QUIT") == 0) {
+            snprintf(response, sizeof(response), "OK BYE %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+            write_log(client_ip, client_port, "DISCONNECT", "Graceful QUIT");
+            break;
+        } else if (!is_authenticated) {
+            snprintf(response, sizeof(response), "ERR 001 AUTH_REQUIRED %s\n", SID_TAG);
+            write_log(client_ip, client_port, "ERROR", "Command rejected: Not authenticated");
+            send(client_fd, response, strlen(response), 0);
+        } else if (strcmp(line_buf, "SYSINFO") == 0) {
+            get_sysinfo(response, sizeof(response));
+            send(client_fd, response, strlen(response), 0);
+        } else if (strcmp(line_buf, "LISTPROC") == 0) {
+            get_listproc(response, sizeof(response));
+            send(client_fd, response, strlen(response), 0);
+        } else if (strncmp(line_buf, "EXEC ", 5) == 0) {
+            char *exec_cmd = line_buf + 5;
+            execute_whitelisted(exec_cmd, response, sizeof(response));
+            send(client_fd, response, strlen(response), 0);
+        } 
+        // === PUT Handler ===
+        else if (strncmp(line_buf, "PUT ", 4) == 0) {
+            char fname[256];
+            long fsize = 0;
+            if (sscanf(line_buf + 4, "%255s %ld", fname, &fsize) == 2) {
+                if (fsize > MAX_FILE_SIZE) {
+                    snprintf(response, sizeof(response), "ERR 004 FILE_TOO_LARGE %s\n", SID_TAG);
+                    send(client_fd, response, strlen(response), 0);
+                } else {
+                    char filepath[512];
+                    snprintf(filepath, sizeof(filepath), "%s/%s", STORAGE_DIR, fname);
+                    FILE *fp = fopen(filepath, "wb");
+                    if (!fp) {
+                        snprintf(response, sizeof(response), "ERR 006 FILE_WRITE_FAILED %s\n", SID_TAG);
+                        send(client_fd, response, strlen(response), 0);
+                    } else {
+                        long remaining = fsize;
+                        char file_buf[BUFFER_SIZE];
+                        while (remaining > 0) {
+                            int to_read = remaining > BUFFER_SIZE ? BUFFER_SIZE : (int)remaining;
+                            int r = recv(client_fd, file_buf, to_read, 0);
+                            if (r <= 0) break;
+                            fwrite(file_buf, 1, r, fp);
+                            remaining -= r;
+                        }
+                        fclose(fp);
+
+                        if (remaining == 0) {
+                            snprintf(response, sizeof(response), "OK FILE_RECEIVED %s %s\n", fname, SID_TAG);
+                            char log_det[256];
+                            snprintf(log_det, sizeof(log_det), "Uploaded %s (%ld bytes)", fname, fsize);
+                            write_log(client_ip, client_port, "PUT", log_det);
+                        } else {
+                            snprintf(response, sizeof(response), "ERR 007 INCOMPLETE_TRANSFER %s\n", SID_TAG);
+                        }
+                        send(client_fd, response, strlen(response), 0);
+                    }
                 }
             }
         }
+        // === GET Handler ===
+        else if (strncmp(line_buf, "GET ", 4) == 0) {
+            char fname[256];
+            if (sscanf(line_buf + 4, "%255s", fname) == 1) {
+                char filepath[512];
+                snprintf(filepath, sizeof(filepath), "%s/%s", STORAGE_DIR, fname);
+                FILE *fp = fopen(filepath, "rb");
+                if (!fp) {
+                    snprintf(response, sizeof(response), "ERR 005 FILE_NOT_FOUND %s\n", SID_TAG);
+                    send(client_fd, response, strlen(response), 0);
+                    write_log(client_ip, client_port, "GET", "File not found");
+                } else {
+                    fseek(fp, 0, SEEK_END);
+                    long fsize = ftell(fp);
+                    fseek(fp, 0, SEEK_SET);
+
+                    snprintf(response, sizeof(response), "OK FILE_SEND %s %ld %s\n", fname, fsize, SID_TAG);
+                    send(client_fd, response, strlen(response), 0);
+
+                    char file_buf[BUFFER_SIZE];
+                    size_t bytes_read;
+                    while ((bytes_read = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
+                        send(client_fd, file_buf, bytes_read, 0);
+                    }
+                    fclose(fp);
+
+                    char log_det[256];
+                    snprintf(log_det, sizeof(log_det), "Downloaded %s (%ld bytes)", fname, fsize);
+                    write_log(client_ip, client_port, "GET", log_det);
+                }
+            }
+        } else {
+            snprintf(response, sizeof(response), "ERR 002 COMMAND_NOT_ALLOWED %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), 0);
+        }
     }
 
-cleanup:
     write_log(client_ip, client_port, "DISCONNECT", "Connection closed");
     printf("[-] Client disconnected %s:%d\n", client_ip, client_port);
     close(client_fd);
@@ -249,9 +319,7 @@ int main() {
     printf("   RemoteOps Agent Started (Multi-threaded)\n");
     printf("   Registration Number : IT24103315\n");
     printf("   Listening Port      : %d\n", PORT);
-    printf("   Session ID Tag      : %s\n", SID_TAG);
-    printf("   Auth Token          : %s\n", AUTH_TOKEN);
-    printf("   Log File            : %s\n", LOG_FILE);
+    printf("   Storage Directory   : %s\n", STORAGE_DIR);
     printf("====================================================\n");
     printf("Agent is ready and listening on port %d...\n", PORT);
 
