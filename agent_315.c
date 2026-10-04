@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -120,7 +121,6 @@ void execute_whitelisted(const char *cmd_name, char *output, size_t max_len) {
     snprintf(output, max_len, "OK EXEC_RESULT %s %s\n", result, SID_TAG);
 }
 
-// Robust helper to read a line ending with \n
 int read_line(int fd, char *buf, int max_len) {
     int idx = 0;
     while (idx < max_len - 1) {
@@ -160,11 +160,14 @@ void *handle_client(void *arg) {
 
     while (1) {
         int len = read_line(client_fd, line_buf, sizeof(line_buf));
-        if (len < 0) break; // Client disconnected
+        if (len < 0) {
+            write_log(client_ip, client_port, "DISCONNECT", "Ungraceful disconnect or socket dropped");
+            printf("[!] Client ungracefully disconnected: %s:%d\n", client_ip, client_port);
+            break;
+        }
 
-        // Trim trailing space
-        while (len > 0 && line_buf[len - 1] == ' ') line_buf[--len] = '\0';
-        if (len == 0) continue;
+        while (len > 0 && (line_buf[len - 1] == ' ' || line_buf[len - 1] == '\t')) line_buf[--len] = '\0';
+        if (len == 0) continue; // Ignore empty lines safely
 
         write_log(client_ip, client_port, "COMMAND", line_buf);
         printf("[%s:%d] Command: %s\n", client_ip, client_port, line_buf);
@@ -182,42 +185,46 @@ void *handle_client(void *arg) {
                 snprintf(response, sizeof(response), "ERR 001 AUTH_FAILED %s\n", SID_TAG);
                 write_log(client_ip, client_port, "AUTH", "Failed token");
             }
-            send(client_fd, response, strlen(response), 0);
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
+        } else if (strcmp(line_buf, "AUTH") == 0) {
+            snprintf(response, sizeof(response), "ERR 001 TOKEN_REQUIRED %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
         } else if (strcmp(line_buf, "QUIT") == 0) {
             snprintf(response, sizeof(response), "OK BYE %s\n", SID_TAG);
-            send(client_fd, response, strlen(response), 0);
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
             write_log(client_ip, client_port, "DISCONNECT", "Graceful QUIT");
             break;
         } else if (!is_authenticated) {
             snprintf(response, sizeof(response), "ERR 001 AUTH_REQUIRED %s\n", SID_TAG);
             write_log(client_ip, client_port, "ERROR", "Command rejected: Not authenticated");
-            send(client_fd, response, strlen(response), 0);
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
         } else if (strcmp(line_buf, "SYSINFO") == 0) {
             get_sysinfo(response, sizeof(response));
-            send(client_fd, response, strlen(response), 0);
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
         } else if (strcmp(line_buf, "LISTPROC") == 0) {
             get_listproc(response, sizeof(response));
-            send(client_fd, response, strlen(response), 0);
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
         } else if (strncmp(line_buf, "EXEC ", 5) == 0) {
             char *exec_cmd = line_buf + 5;
             execute_whitelisted(exec_cmd, response, sizeof(response));
-            send(client_fd, response, strlen(response), 0);
-        } 
-        // === PUT Handler ===
-        else if (strncmp(line_buf, "PUT ", 4) == 0) {
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
+        } else if (strcmp(line_buf, "EXEC") == 0) {
+            snprintf(response, sizeof(response), "ERR 002 COMMAND_MISSING %s\n", SID_TAG);
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
+        } else if (strncmp(line_buf, "PUT ", 4) == 0) {
             char fname[256];
             long fsize = 0;
             if (sscanf(line_buf + 4, "%255s %ld", fname, &fsize) == 2) {
                 if (fsize > MAX_FILE_SIZE) {
                     snprintf(response, sizeof(response), "ERR 004 FILE_TOO_LARGE %s\n", SID_TAG);
-                    send(client_fd, response, strlen(response), 0);
+                    send(client_fd, response, strlen(response), MSG_NOSIGNAL);
                 } else {
                     char filepath[512];
                     snprintf(filepath, sizeof(filepath), "%s/%s", STORAGE_DIR, fname);
                     FILE *fp = fopen(filepath, "wb");
                     if (!fp) {
                         snprintf(response, sizeof(response), "ERR 006 FILE_WRITE_FAILED %s\n", SID_TAG);
-                        send(client_fd, response, strlen(response), 0);
+                        send(client_fd, response, strlen(response), MSG_NOSIGNAL);
                     } else {
                         long remaining = fsize;
                         char file_buf[BUFFER_SIZE];
@@ -238,13 +245,14 @@ void *handle_client(void *arg) {
                         } else {
                             snprintf(response, sizeof(response), "ERR 007 INCOMPLETE_TRANSFER %s\n", SID_TAG);
                         }
-                        send(client_fd, response, strlen(response), 0);
+                        send(client_fd, response, strlen(response), MSG_NOSIGNAL);
                     }
                 }
+            } else {
+                snprintf(response, sizeof(response), "ERR 008 MALFORMED_PUT_CMD %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), MSG_NOSIGNAL);
             }
-        }
-        // === GET Handler ===
-        else if (strncmp(line_buf, "GET ", 4) == 0) {
+        } else if (strncmp(line_buf, "GET ", 4) == 0) {
             char fname[256];
             if (sscanf(line_buf + 4, "%255s", fname) == 1) {
                 char filepath[512];
@@ -252,7 +260,7 @@ void *handle_client(void *arg) {
                 FILE *fp = fopen(filepath, "rb");
                 if (!fp) {
                     snprintf(response, sizeof(response), "ERR 005 FILE_NOT_FOUND %s\n", SID_TAG);
-                    send(client_fd, response, strlen(response), 0);
+                    send(client_fd, response, strlen(response), MSG_NOSIGNAL);
                     write_log(client_ip, client_port, "GET", "File not found");
                 } else {
                     fseek(fp, 0, SEEK_END);
@@ -260,12 +268,12 @@ void *handle_client(void *arg) {
                     fseek(fp, 0, SEEK_SET);
 
                     snprintf(response, sizeof(response), "OK FILE_SEND %s %ld %s\n", fname, fsize, SID_TAG);
-                    send(client_fd, response, strlen(response), 0);
+                    send(client_fd, response, strlen(response), MSG_NOSIGNAL);
 
                     char file_buf[BUFFER_SIZE];
                     size_t bytes_read;
                     while ((bytes_read = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
-                        send(client_fd, file_buf, bytes_read, 0);
+                        send(client_fd, file_buf, bytes_read, MSG_NOSIGNAL);
                     }
                     fclose(fp);
 
@@ -273,20 +281,24 @@ void *handle_client(void *arg) {
                     snprintf(log_det, sizeof(log_det), "Downloaded %s (%ld bytes)", fname, fsize);
                     write_log(client_ip, client_port, "GET", log_det);
                 }
+            } else {
+                snprintf(response, sizeof(response), "ERR 008 MALFORMED_GET_CMD %s\n", SID_TAG);
+                send(client_fd, response, strlen(response), MSG_NOSIGNAL);
             }
         } else {
             snprintf(response, sizeof(response), "ERR 002 COMMAND_NOT_ALLOWED %s\n", SID_TAG);
-            send(client_fd, response, strlen(response), 0);
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
         }
     }
 
-    write_log(client_ip, client_port, "DISCONNECT", "Connection closed");
-    printf("[-] Client disconnected %s:%d\n", client_ip, client_port);
     close(client_fd);
     return NULL;
 }
 
 int main() {
+    // 1. Crucial Fix: Prevent SIGPIPE crashes when client ungracefully disconnects
+    signal(SIGPIPE, SIG_IGN);
+
     int server_fd;
     struct sockaddr_in server_addr;
 
@@ -316,7 +328,7 @@ int main() {
     }
 
     printf("====================================================\n");
-    printf("   RemoteOps Agent Started (Multi-threaded)\n");
+    printf("   RemoteOps Agent (Hardened & Multi-threaded)\n");
     printf("   Registration Number : IT24103315\n");
     printf("   Listening Port      : %d\n", PORT);
     printf("   Storage Directory   : %s\n", STORAGE_DIR);
