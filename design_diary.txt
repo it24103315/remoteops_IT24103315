@@ -1,31 +1,16 @@
-
 --------------------------------------------------------------------------------
-Date: 2026-10-04
-Stage: Binary File Transfer Engine (PUT & GET)
+Date: 2026-10-05
+Stage: Secondary UDP Monitoring Channel & Stream Lifecycle (MONITOR START/STOP)
 
 Key Decisions Made:
-1. Exact Byte-Count Transfer:
-   - Implemented binary streaming for PUT and GET commands. The protocol transmits 
-     exact <filesize> bytes sequentially after the single-line control command.
-   - Handled partial recv() chunks using iterative buffer loops to ensure exact 
-     byte integrity without truncating files.
+1. UDP Architecture:
+   - Created a dedicated POSIX thread (udp_monitor_thread) triggered by MONITOR START.
+   - Used SOCK_DGRAM UDP sockets transmitting lightweight metric datagrams to the 
+     Controller IP on the dynamically specified target UDP port.
+   - Paced datagram interval at 2.0 seconds with responsive sub-interval polling to 
+     allow instant cancellation without blocking.
 
-2. Storage Isolation:
-   - Configured Agent to save all uploads under the personalized directory path:
-     ./agentfiles/IT24103315/<filename>
-   - Enforced a 10MB maximum file size ceiling to prevent memory/disk exhaustion, 
-     returning ERR 004 FILE_TOO_LARGE upon exceeding limits.
-
-3. Download & Error Handling:
-   - Implemented GET handling ensuring verification of file existence before 
-     dispatching OK FILE_SEND. Missing files return ERR 005 FILE_NOT_FOUND.
-   - Byte-for-byte verification confirmed matching hashes between original and 
-     downloaded files.
-
-Obstacles & Solutions:
-- Challenge: Line buffering mixed with binary stream caused blocking when using 
-  unbuffered recv.
-- Solution: Created a dedicated read_line() helper for control commands that 
-  stops precisely at '\n', leaving the subsequent socket stream aligned for 
-  exact binary reading.
-
+2. State Management & Teardown:
+   - Designed atomic cancellation flag (volatile int running) to gracefully terminate 
+     the telemetry thread on MONITOR STOP or client disconnect.
+   - Ensured all UDP datagrams append the mandatory reversed session tag 'SID:5133'.
