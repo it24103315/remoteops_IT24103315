@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -19,6 +20,44 @@ int recv_line(int sock, char *buf, int max_len) {
     }
     buf[idx] = '\0';
     return idx;
+}
+
+// Background thread listening for UDP Telemetry datagrams
+typedef struct {
+    int udp_port;
+    volatile int running;
+} udp_listener_t;
+
+void *udp_listener_thread(void *arg) {
+    udp_listener_t *listener = (udp_listener_t *)arg;
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) return NULL;
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port = htons(listener->udp_port);
+
+    if (bind(udp_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        close(udp_sock);
+        return NULL;
+    }
+
+    char buf[512];
+    while (listener->running) {
+        struct sockaddr_in sender;
+        socklen_t slen = sizeof(sender);
+        int r = recvfrom(udp_sock, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&sender, &slen);
+        if (r > 0) {
+            buf[r] = '\0';
+            printf("\n[UDP TELEMETRY] %s", buf);
+            printf("RemoteOps> ");
+            fflush(stdout);
+        }
+    }
+    close(udp_sock);
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -50,11 +89,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Connected! Type commands (e.g., AUTH OPS-3315, PUT <filename>, GET <filename>)\n");
-    printf("-----------------------------------------------------------------------------\n");
+    printf("Connected! Available commands: AUTH, SYSINFO, LISTPROC, EXEC, PUT, GET, MONITOR START <port>, MONITOR STOP, QUIT\n");
+    printf("--------------------------------------------------------------------------------------------------------\n");
 
     char input[BUFFER_SIZE];
     char recv_buf[BUFFER_SIZE];
+
+    udp_listener_t ulistener;
+    ulistener.running = 0;
+    pthread_t utid = 0;
 
     while (1) {
         printf("RemoteOps> ");
@@ -67,8 +110,27 @@ int main(int argc, char *argv[]) {
         size_t len = strlen(cmd);
         if (len > 0 && cmd[len - 1] == '\n') cmd[len - 1] = '\0';
 
-        // === LOCAL PUT HANDLING ===
-        if (strncmp(cmd, "PUT ", 4) == 0) {
+        // === MONITOR START HANDLING ===
+        if (strncmp(cmd, "MONITOR START ", 14) == 0) {
+            int uport = atoi(cmd + 14);
+            if (uport > 0) {
+                if (ulistener.running) {
+                    ulistener.running = 0;
+                    pthread_cancel(utid);
+                }
+                ulistener.udp_port = uport;
+                ulistener.running = 1;
+                pthread_create(&utid, NULL, udp_listener_thread, &ulistener);
+            }
+        } else if (strcmp(cmd, "MONITOR STOP") == 0) {
+            if (ulistener.running) {
+                ulistener.running = 0;
+                pthread_cancel(utid);
+                utid = 0;
+            }
+        }
+        // === PUT HANDLING ===
+        else if (strncmp(cmd, "PUT ", 4) == 0) {
             char fname[256];
             if (sscanf(cmd + 4, "%255s", fname) == 1) {
                 FILE *fp = fopen(fname, "rb");
@@ -97,7 +159,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
         }
-        // === LOCAL GET HANDLING ===
+        // === GET HANDLING ===
         else if (strncmp(cmd, "GET ", 4) == 0) {
             char fname[256];
             if (sscanf(cmd + 4, "%255s", fname) == 1) {
@@ -133,7 +195,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Generic commands
+        // Send normal command
         if (send(sock_fd, input, strlen(input), 0) < 0) break;
 
         if (recv_line(sock_fd, recv_buf, sizeof(recv_buf)) <= 0) {
@@ -143,6 +205,11 @@ int main(int argc, char *argv[]) {
         printf("%s\n", recv_buf);
 
         if (strncmp(input, "QUIT", 4) == 0) break;
+    }
+
+    if (ulistener.running) {
+        ulistener.running = 0;
+        pthread_cancel(utid);
     }
 
     close(sock_fd);

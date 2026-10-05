@@ -135,6 +135,68 @@ int read_line(int fd, char *buf, int max_len) {
     return idx;
 }
 
+// UDP Telemetry Worker Thread Context
+typedef struct {
+    char target_ip[INET_ADDRSTRLEN];
+    int target_port;
+    volatile int running;
+} udp_monitor_ctx_t;
+
+void *udp_monitor_thread(void *arg) {
+    udp_monitor_ctx_t *ctx = (udp_monitor_ctx_t *)arg;
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        perror("UDP socket creation failed");
+        return NULL;
+    }
+
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(ctx->target_port);
+    inet_pton(AF_INET, ctx->target_ip, &dest_addr.sin_addr);
+
+    printf("[UDP] Started telemetry stream to %s:%d\n", ctx->target_ip, ctx->target_port);
+
+    while (ctx->running) {
+        // Collect telemetry
+        double load = 0.0;
+        FILE *f_load = fopen("/proc/loadavg", "r");
+        if (f_load) { fscanf(f_load, "%lf", &load); fclose(f_load); }
+
+        long total_mem = 0, free_mem = 0;
+        FILE *f_mem = fopen("/proc/meminfo", "r");
+        if (f_mem) {
+            char line[128];
+            while (fgets(line, sizeof(line), f_mem)) {
+                if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line + 9, "%ld", &total_mem);
+                if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line + 13, "%ld", &free_mem);
+            }
+            fclose(f_mem);
+        }
+        long used_mem_mb = (total_mem - free_mem) / 1024;
+        if (used_mem_mb < 0) used_mem_mb = 0;
+
+        long uptime_sec = 0;
+        FILE *f_up = fopen("/proc/uptime", "r");
+        if (f_up) { double up_val = 0; fscanf(f_up, "%lf", &up_val); uptime_sec = (long)up_val; fclose(f_up); }
+
+        char packet[256];
+        snprintf(packet, sizeof(packet), "SYSINFO %.2f %ld %ld %s\n", load, used_mem_mb, uptime_sec, SID_TAG);
+
+        sendto(udp_sock, packet, strlen(packet), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+        // Sleep 2 seconds between datagrams
+        for (int i = 0; i < 20 && ctx->running; i++) {
+            usleep(100000); // 100ms chunks to allow quick cancellation
+        }
+    }
+
+    close(udp_sock);
+    printf("[UDP] Stopped telemetry stream to %s:%d\n", ctx->target_ip, ctx->target_port);
+    return NULL;
+}
+
 typedef struct {
     int client_fd;
     struct sockaddr_in client_addr;
@@ -156,6 +218,11 @@ void *handle_client(void *arg) {
     int is_authenticated = 0;
     char line_buf[BUFFER_SIZE];
 
+    // UDP context per client session
+    udp_monitor_ctx_t udp_ctx;
+    memset(&udp_ctx, 0, sizeof(udp_ctx));
+    pthread_t udp_tid = 0;
+
     mkdir(STORAGE_DIR, 0755);
 
     while (1) {
@@ -167,7 +234,7 @@ void *handle_client(void *arg) {
         }
 
         while (len > 0 && (line_buf[len - 1] == ' ' || line_buf[len - 1] == '\t')) line_buf[--len] = '\0';
-        if (len == 0) continue; // Ignore empty lines safely
+        if (len == 0) continue;
 
         write_log(client_ip, client_port, "COMMAND", line_buf);
         printf("[%s:%d] Command: %s\n", client_ip, client_port, line_buf);
@@ -211,7 +278,42 @@ void *handle_client(void *arg) {
         } else if (strcmp(line_buf, "EXEC") == 0) {
             snprintf(response, sizeof(response), "ERR 002 COMMAND_MISSING %s\n", SID_TAG);
             send(client_fd, response, strlen(response), MSG_NOSIGNAL);
-        } else if (strncmp(line_buf, "PUT ", 4) == 0) {
+        } 
+        // === MONITOR START <udp_port> ===
+        else if (strncmp(line_buf, "MONITOR START", 13) == 0) {
+            int target_uport = 0;
+            if (sscanf(line_buf + 13, "%d", &target_uport) == 1 && target_uport > 0 && target_uport <= 65535) {
+                if (udp_ctx.running) {
+                    udp_ctx.running = 0;
+                    pthread_join(udp_tid, NULL);
+                }
+                strncpy(udp_ctx.target_ip, client_ip, sizeof(udp_ctx.target_ip));
+                udp_ctx.target_port = target_uport;
+                udp_ctx.running = 1;
+                pthread_create(&udp_tid, NULL, udp_monitor_thread, &udp_ctx);
+
+                snprintf(response, sizeof(response), "OK MONITOR_STARTED %s\n", SID_TAG);
+                write_log(client_ip, client_port, "MONITOR", "Started UDP stream");
+            } else {
+                snprintf(response, sizeof(response), "ERR 009 INVALID_UDP_PORT %s\n", SID_TAG);
+            }
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
+        }
+        // === MONITOR STOP ===
+        else if (strcmp(line_buf, "MONITOR STOP") == 0) {
+            if (udp_ctx.running) {
+                udp_ctx.running = 0;
+                pthread_join(udp_tid, NULL);
+                udp_tid = 0;
+                snprintf(response, sizeof(response), "OK MONITOR_STOPPED %s\n", SID_TAG);
+                write_log(client_ip, client_port, "MONITOR", "Stopped UDP stream");
+            } else {
+                snprintf(response, sizeof(response), "OK MONITOR_STOPPED %s\n", SID_TAG);
+            }
+            send(client_fd, response, strlen(response), MSG_NOSIGNAL);
+        }
+        // === PUT Handler ===
+        else if (strncmp(line_buf, "PUT ", 4) == 0) {
             char fname[256];
             long fsize = 0;
             if (sscanf(line_buf + 4, "%255s %ld", fname, &fsize) == 2) {
@@ -252,7 +354,9 @@ void *handle_client(void *arg) {
                 snprintf(response, sizeof(response), "ERR 008 MALFORMED_PUT_CMD %s\n", SID_TAG);
                 send(client_fd, response, strlen(response), MSG_NOSIGNAL);
             }
-        } else if (strncmp(line_buf, "GET ", 4) == 0) {
+        }
+        // === GET Handler ===
+        else if (strncmp(line_buf, "GET ", 4) == 0) {
             char fname[256];
             if (sscanf(line_buf + 4, "%255s", fname) == 1) {
                 char filepath[512];
@@ -291,12 +395,17 @@ void *handle_client(void *arg) {
         }
     }
 
+    // Cleanup active UDP stream upon disconnect
+    if (udp_ctx.running) {
+        udp_ctx.running = 0;
+        pthread_join(udp_tid, NULL);
+    }
+
     close(client_fd);
     return NULL;
 }
 
 int main() {
-    // 1. Crucial Fix: Prevent SIGPIPE crashes when client ungracefully disconnects
     signal(SIGPIPE, SIG_IGN);
 
     int server_fd;
@@ -328,12 +437,13 @@ int main() {
     }
 
     printf("====================================================\n");
-    printf("   RemoteOps Agent (Hardened & Multi-threaded)\n");
+    printf("   RemoteOps Agent (Full Protocol & UDP Telemetry)\n");
     printf("   Registration Number : IT24103315\n");
-    printf("   Listening Port      : %d\n", PORT);
+    printf("   TCP Listening Port  : %d\n", PORT);
+    printf("   Session ID Tag      : %s\n", SID_TAG);
     printf("   Storage Directory   : %s\n", STORAGE_DIR);
     printf("====================================================\n");
-    printf("Agent is ready and listening on port %d...\n", PORT);
+    printf("Agent is ready and listening for connections...\n");
 
     while (1) {
         client_info_t *info = malloc(sizeof(client_info_t));
