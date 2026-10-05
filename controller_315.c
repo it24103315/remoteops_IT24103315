@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -129,7 +130,7 @@ int main(int argc, char *argv[]) {
                 utid = 0;
             }
         }
-        // === PUT HANDLING ===
+        // === PUT HANDLING WITH THROUGHPUT BENCHMARKING ===
         else if (strncmp(cmd, "PUT ", 4) == 0) {
             char fname[256];
             if (sscanf(cmd + 4, "%255s", fname) == 1) {
@@ -146,20 +147,30 @@ int main(int argc, char *argv[]) {
                 snprintf(put_cmd, sizeof(put_cmd), "PUT %s %ld\n", fname, fsize);
                 send(sock_fd, put_cmd, strlen(put_cmd), 0);
 
+                clock_t start_time = clock();
                 char file_buf[BUFFER_SIZE];
                 size_t r;
+                long total_sent = 0;
                 while ((r = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
                     send(sock_fd, file_buf, r, 0);
+                    total_sent += r;
                 }
                 fclose(fp);
+                clock_t end_time = clock();
+
+                double elapsed_sec = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+                if (elapsed_sec <= 0.000001) elapsed_sec = 0.0001; // Avoid divide by zero
+                double throughput_kbps = (total_sent / 1024.0) / elapsed_sec;
 
                 if (recv_line(sock_fd, recv_buf, sizeof(recv_buf)) > 0) {
                     printf("%s\n", recv_buf);
+                    printf("[Performance] Uploaded %ld bytes in %.4f s (Throughput: %.2f KB/s)\n",
+                           total_sent, elapsed_sec, throughput_kbps);
                 }
                 continue;
             }
         }
-        // === GET HANDLING ===
+        // === GET HANDLING WITH THROUGHPUT BENCHMARKING ===
         else if (strncmp(cmd, "GET ", 4) == 0) {
             char fname[256];
             if (sscanf(cmd + 4, "%255s", fname) == 1) {
@@ -177,6 +188,7 @@ int main(int argc, char *argv[]) {
                         snprintf(save_as, sizeof(save_as), "downloaded_%s", fname);
                         FILE *fp = fopen(save_as, "wb");
                         if (fp) {
+                            clock_t start_time = clock();
                             long remaining = fsize;
                             char file_buf[BUFFER_SIZE];
                             while (remaining > 0) {
@@ -187,7 +199,15 @@ int main(int argc, char *argv[]) {
                                 remaining -= n;
                             }
                             fclose(fp);
+                            clock_t end_time = clock();
+
+                            double elapsed_sec = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+                            if (elapsed_sec <= 0.000001) elapsed_sec = 0.0001;
+                            double throughput_kbps = (fsize / 1024.0) / elapsed_sec;
+
                             printf("[+] Successfully saved downloaded file as '%s' (%ld bytes)\n", save_as, fsize);
+                            printf("[Performance] Download throughput: %.2f KB/s (Duration: %.4f s)\n",
+                                   throughput_kbps, elapsed_sec);
                         }
                     }
                 }
