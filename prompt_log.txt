@@ -1,0 +1,29 @@
+================================================================================
+RemoteOps AI Interaction & Prompt Log - IT24103315
+CLEAR Level 3: AI Collaboration
+================================================================================
+
+1. Interaction 1: Parameter derivation and build configuration
+   - Tool: Google Antigravity / Gemini 3.8
+   - Purpose: Derived Port 9410, SID:5133, Token OPS-3315 based on Section 2.4 formulas.
+   - Outcome: Configured Makefile_315 with -pthread and -O2 optimization flags.
+
+2. Interaction 2: Multi-threaded TCP server architecture & framing
+   - Tool: Google Antigravity / Gemini 3.8
+   - Purpose: Designed POSIX threads (pthread) server handling line-based ASCII framing.
+   - Outcome: Implemented read_line() helper to prevent command fragmentation and mutex logging.
+
+3. Interaction 3: Binary file streaming and SIGPIPE signal immunity
+   - Tool: Google Antigravity / Gemini 3.8
+   - Purpose: Handled byte-counted binary streaming and client drop protection.
+   - Outcome: Adopted exact byte counting loops for PUT/GET and added SIGPIPE ignore.
+
+4. Interaction 4: Secondary UDP Telemetry loop and lifecycle management
+   - Tool: Google Antigravity / Gemini 3.8
+   - Purpose: Background UDP thread transmitting system stats datagrams.
+   - Outcome: Created udp_monitor_thread sending SYSINFO datagrams every 2 seconds with atomic stop.
+
+5. Interaction 5: Throughput benchmarking and automated stress testing
+   - Tool: Google Antigravity / Gemini 3.8
+   - Purpose: Tested 5 concurrent connections and computed transfer throughput in KB/s.
+   - Outcome: Created test_concurrency.sh and updated Controller with clock timers.
