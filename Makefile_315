@@ -1,13 +1,29 @@
+# ==============================================================================
+# Makefile for RemoteOps: A Remote System Monitoring and Management Tool
+# Student Registration Number: IT24103315
+# Personalized Source Files: agent_315.c, controller_315.c
+# ==============================================================================
+
 CC = gcc
-CFLAGS = -Wall -Wextra -pthread -O2
+CFLAGS = -Wall -Wextra -pedantic -std=gnu11 -O2 -pthread
 
-all: agent_315 controller_315
+AGENT_SRC = agent_315.c
+CONTROLLER_SRC = controller_315.c
 
-agent_315: agent_315.c
-	$(CC) $(CFLAGS) -o agent_315 agent_315.c
+AGENT_BIN = agent_315
+CONTROLLER_BIN = controller_315
 
-controller_315: controller_315.c
-	$(CC) $(CFLAGS) -o controller_315 controller_315.c
+all: $(AGENT_BIN) $(CONTROLLER_BIN)
+
+$(AGENT_BIN): $(AGENT_SRC)
+	$(CC) $(CFLAGS) -o $(AGENT_BIN) $(AGENT_SRC)
+
+$(CONTROLLER_BIN): $(CONTROLLER_SRC)
+	$(CC) $(CFLAGS) -o $(CONTROLLER_BIN) $(CONTROLLER_SRC)
 
 clean:
-	rm -f agent_315 controller_315
+	rm -f $(AGENT_BIN) $(CONTROLLER_BIN) downloaded_*
+
+rebuild: clean all
+
+.PHONY: all clean rebuild
