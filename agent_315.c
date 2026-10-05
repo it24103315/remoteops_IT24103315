@@ -1,3 +1,15 @@
+/* ==============================================================================
+ * Project: RemoteOps - Remote System Monitoring and Management Tool
+ * Module: IE3090 - Network Programming (Year 3, Semester 1)
+ * Student Registration Number: IT24103315
+ * 
+ * Concurrency Architecture & Thread Safety:
+ * - Multi-threaded model using POSIX Threads (pthread).
+ * - Per-client thread handles TCP command dispatch and state.
+ * - Thread-safe logging protected via mutex (log_mutex).
+ * - Secondary background thread per session handles UDP telemetry.
+ * - Robust SIGPIPE signal suppression to prevent ungraceful client termination crashes.
+ * ============================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
