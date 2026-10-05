@@ -1,0 +1,39 @@
+================================================================================
+Structured Learning Reflection on AI Usage - IT24103315 
+================================================================================
+
+1. Which AI tools were used, and at which stages?
+During the design and implementation of the RemoteOps project, I utilized Google Antigravity 
+(Gemini 3.8) at three key stages: initially during architectural scaffolding (deriving my 
+personalized parameters: Port 9410, SID:5133, Token OPS-3315, and structuring Makefile_315), 
+during the development of the binary file transfer loops (PUT and GET byte counts), and finally 
+when formulating the multi-threaded concurrency model and secondary UDP telemetry pipeline.
+
+2. What did the AI do well, and where did it mislead or encounter limitations?
+The AI excelled at drafting standard POSIX socket boilerplate, explaining operating system APIs 
+(such as extracting Linux kernel metrics directly from the /proc virtual filesystem), and 
+suggesting appropriate synchronization primitives like pthread_mutex_t for thread-safe file 
+logging. However, it initially attempted a naive single-byte recv() mechanism that suffered from 
+blocking issues when transitioning between newline-terminated ASCII control commands and raw 
+binary file streams. Additionally, early draft snippets lacked SIGPIPE signal suppression, 
+which would have caused the server to crash abruptly whenever a client disconnected without 
+issuing a clean QUIT command.
+
+3. What was changed, added, or rejected from AI output, and why?
+I critically reviewed and restructured the suggested network handling. Specifically:
+- I introduced a dedicated read_line() framing function to strictly enforce line-based ASCII 
+  delimiters while preserving exact byte alignment for following binary transfers.
+- I enforced a strict 10MB file size ceiling (ERR 004 FILE_TOO_LARGE) to defend against memory 
+  exhaustion and denial-of-service attempts.
+- I added 'signal(SIGPIPE, SIG_IGN)' and MSG_NOSIGNAL flags to socket write calls to ensure the 
+  Agent remains resilient against ungraceful client terminations.
+- I restructured the UDP telemetry thread to sleep in responsive sub-intervals (100ms slices), 
+  enabling instantaneous response to MONITOR STOP commands rather than blocking for full seconds.
+
+4. What was learned about network programming through completing this assignment?
+Completing RemoteOps provided invaluable insights into the stark contrast between application-layer 
+abstractions and transport-layer realities. I learned that TCP is a continuous byte stream without 
+inherent message boundaries, necessitating robust custom framing mechanisms. I also gained a 
+thorough understanding of multi-threaded race conditions, the importance of mutex synchronization 
+in shared resource logging, and the fundamental architectural difference between reliable, 
+connection-oriented TCP control channels and lightweight, connectionless UDP telemetry streams.
